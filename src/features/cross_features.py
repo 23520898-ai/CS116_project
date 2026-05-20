@@ -15,6 +15,7 @@ def build_cross_features(
     trans_df:        pl.DataFrame,
     covisit_scores:  dict[int, dict[str, float]] | None = None,
     w2v_scores:      dict[int, dict[str, float]] | None = None,
+    items_df:        pl.DataFrame | None = None,
 ) -> pl.DataFrame:
     """
     Build cross features for a DataFrame of (customer_id, item_id) candidate
@@ -24,18 +25,18 @@ def build_cross_features(
     ----------
     candidates_df  : DataFrame with columns [customer_id, item_id,
                      from_history (int8), from_covisit (int8),
-                     from_w2v (int8)]
+                     from_w2v (int8), stage1_rank (int32)]
     trans_df       : training transactions
     covisit_scores : {customer_id: {item_id: score}}  (from stage-1)
     w2v_scores     : {customer_id: {item_id: cosine_sim}}  (from stage-1)
+    items_df       : items metadata (optional). When provided, adds
+                     user×category affinity features:
+                     ui_user_cat1_count, ui_user_cat2_count,
+                     ui_user_cat1_pct,   ui_user_cat2_pct.
 
     Returns
     -------
-    candidates_df with additional columns:
-      ui_in_history, ui_history_count, ui_history_last_days,
-      ui_covisit_score, ui_w2v_score,
-      ui_price_ratio  (item avg price / user avg price),
-      from_history, from_covisit, from_w2v  (already present, kept)
+    candidates_df with additional feature columns
     """
     ref = trans_df["updated_date"].max()
 
@@ -98,5 +99,56 @@ def build_cross_features(
     if "ui_w2v_score" not in out.columns:
         out = out.with_columns(pl.lit(0.0).alias("ui_w2v_score"))
     out = out.with_columns(pl.col("ui_w2v_score").fill_null(0.0))
+
+    # ── User×Category affinity features (requires items metadata) ─────────────
+    # For each (user, candidate_item) pair:
+    #   - How many times has the user bought from category_l1 / _l2 of this item?
+    #   - What fraction of the user's purchases are in that category?
+    if items_df is not None and "category_l1" in items_df.columns:
+        item_cats = items_df.select(["item_id", "category_l1", "category_l2"])
+
+        # Count user purchases per category (trans_df × item categories)
+        trans_cats = trans_df.select(["customer_id", "item_id"]).join(
+            item_cats, on="item_id", how="left"
+        )
+        user_cat1_cnt = (
+            trans_cats
+            .filter(pl.col("category_l1").is_not_null())
+            .group_by(["customer_id", "category_l1"])
+            .agg(pl.len().cast(pl.Float32).alias("_uc1_cnt"))
+        )
+        user_cat2_cnt = (
+            trans_cats
+            .filter(pl.col("category_l2").is_not_null())
+            .group_by(["customer_id", "category_l2"])
+            .agg(pl.len().cast(pl.Float32).alias("_uc2_cnt"))
+        )
+        user_total_cnt = (
+            trans_df
+            .group_by("customer_id")
+            .agg(pl.len().cast(pl.Float32).alias("_u_total"))
+        )
+
+        # Add item categories to candidates, then look up affinity counts
+        out = (
+            out
+            .join(item_cats, on="item_id", how="left")
+            .join(user_cat1_cnt, on=["customer_id", "category_l1"], how="left")
+            .join(user_cat2_cnt, on=["customer_id", "category_l2"], how="left")
+            .join(user_total_cnt, on="customer_id", how="left")
+            .with_columns([
+                pl.col("_uc1_cnt").fill_null(0.0).alias("ui_user_cat1_count"),
+                pl.col("_uc2_cnt").fill_null(0.0).alias("ui_user_cat2_count"),
+                (
+                    pl.col("_uc1_cnt").fill_null(0.0)
+                    / (pl.col("_u_total").fill_null(1.0) + 1e-6)
+                ).alias("ui_user_cat1_pct"),
+                (
+                    pl.col("_uc2_cnt").fill_null(0.0)
+                    / (pl.col("_u_total").fill_null(1.0) + 1e-6)
+                ).alias("ui_user_cat2_pct"),
+            ])
+            .drop(["category_l1", "category_l2", "_uc1_cnt", "_uc2_cnt", "_u_total"])
+        )
 
     return out

@@ -50,12 +50,14 @@ W2V_EPOCHS      = 10
 W2V_WORKERS     = max(1, (os.cpu_count() or 8) - 1)
 
 # ── Stage 2: Reranking ────────────────────────────────────────────────────────
-RANKER_N_ESTIMATORS  = 500
+RANKER_N_ESTIMATORS  = 1000
 RANKER_LEARNING_RATE = 0.05
 RANKER_MAX_DEPTH     = 6
 RANKER_NUM_LEAVES    = 63
 RANKER_SUBSAMPLE     = 0.8
 RANKER_COLSAMPLE     = 0.8
+RANKER_OBJECTIVE     = "lambdarank"   # "lambdarank" (recommended) or "binary"
+RANKER_MIN_CHILD_SAMPLES = 10         # lower than LGBM default (20) for ranking
 RANKER_TOP_K_OUTPUT  = 10   # final output items per user
 
 # Training sampling

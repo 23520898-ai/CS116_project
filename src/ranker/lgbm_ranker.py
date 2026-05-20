@@ -26,32 +26,39 @@ _FEATURE_COLS: list[str] = []
 
 class LGBMRanker:
     """
-    LightGBM binary classifier used as a pointwise ranker.
+    LightGBM ranker supporting two objectives:
+      - ``lambdarank`` (default): LambdaMART – group-aware, directly optimises
+        NDCG.  Significantly better Precision@k / MAP than binary classification.
+      - ``binary``: backward-compatible pointwise binary classifier.
 
-    After training, items are scored by predicted purchase probability
-    and ranked per user.
+    The public interface (fit / predict_proba / rank / save / load) is identical
+    for both objectives, so callers do not need to change.
     """
 
     def __init__(
         self,
-        n_estimators:   int   = 500,
-        learning_rate:  float = 0.05,
-        max_depth:      int   = 6,
-        num_leaves:     int   = 63,
-        subsample:      float = 0.8,
-        colsample:      float = 0.8,
-        random_state:   int   = 42,
-        n_jobs:         int   = -1,
+        n_estimators:      int   = 1000,
+        learning_rate:     float = 0.05,
+        max_depth:         int   = 6,
+        num_leaves:        int   = 63,
+        subsample:         float = 0.8,
+        colsample:         float = 0.8,
+        random_state:      int   = 42,
+        n_jobs:            int   = -1,
+        objective:         str   = "lambdarank",
+        min_child_samples: int   = 10,
     ) -> None:
-        self.n_estimators  = n_estimators
-        self.learning_rate = learning_rate
-        self.max_depth     = max_depth
-        self.num_leaves    = num_leaves
-        self.subsample     = subsample
-        self.colsample     = colsample
-        self.random_state  = random_state
-        self.n_jobs        = n_jobs
-        self._model: Any   = None
+        self.n_estimators      = n_estimators
+        self.learning_rate     = learning_rate
+        self.max_depth         = max_depth
+        self.num_leaves        = num_leaves
+        self.subsample         = subsample
+        self.colsample         = colsample
+        self.random_state      = random_state
+        self.n_jobs            = n_jobs
+        self.objective         = objective
+        self.min_child_samples = min_child_samples
+        self._model: Any       = None
         self.feature_cols: list[str] = []
 
     # ── Fit ───────────────────────────────────────────────────────────────────
@@ -82,34 +89,86 @@ class LGBMRanker:
         skip = set(exclude_cols or []) | {label_col}
         self.feature_cols = [c for c in train_df.columns if c not in skip]
 
-        X = train_df.select(self.feature_cols).to_numpy().astype(np.float32)
-        y = train_df[label_col].to_numpy().astype(np.int32)
+        if self.objective == "lambdarank":
+            # ── LambdaMART: group-aware listwise ranking ──────────────────────
+            # Data must be sorted by customer_id so LightGBM group boundaries
+            # align with the X / y arrays.
+            train_sorted = train_df.sort("customer_id")
 
-        log.info(
-            "Training LGBMRanker  |  samples=%d  positives=%d  features=%d",
-            len(y), int(y.sum()), len(self.feature_cols),
-        )
+            # Group sizes in the same (sorted) order as train_sorted rows.
+            groups: list[int] = (
+                train_sorted
+                .group_by("customer_id", maintain_order=True)
+                .agg(pl.len().alias("_cnt"))
+                ["_cnt"]
+                .to_list()
+            )
 
-        self._model = lgb.LGBMClassifier(
-            n_estimators=self.n_estimators,
-            learning_rate=self.learning_rate,
-            max_depth=self.max_depth,
-            num_leaves=self.num_leaves,
-            subsample=self.subsample,
-            colsample_bytree=self.colsample,
-            objective="binary",
-            metric="auc",
-            random_state=self.random_state,
-            n_jobs=self.n_jobs,
-            verbose=-1,
-        )
-        self._model.fit(X, y)
+            X = train_sorted.select(self.feature_cols).to_numpy().astype(np.float32)
+            y = train_sorted[label_col].to_numpy().astype(np.int32)
+
+            log.info(
+                "Training LGBMRanker(lambdarank)  |"
+                "  samples=%d  positives=%d  features=%d  groups=%d",
+                len(y), int(y.sum()), len(self.feature_cols), len(groups),
+            )
+
+            self._model = lgb.LGBMRanker(
+                objective="lambdarank",
+                metric="ndcg",
+                ndcg_eval_at=[10],
+                n_estimators=self.n_estimators,
+                learning_rate=self.learning_rate,
+                max_depth=self.max_depth,
+                num_leaves=self.num_leaves,
+                subsample=self.subsample,
+                colsample_bytree=self.colsample,
+                min_child_samples=self.min_child_samples,
+                random_state=self.random_state,
+                n_jobs=self.n_jobs,
+                verbose=-1,
+            )
+            self._model.fit(X, y, group=groups)
+
+        else:
+            # ── Binary classification (backward-compat pointwise mode) ────────
+            X = train_df.select(self.feature_cols).to_numpy().astype(np.float32)
+            y = train_df[label_col].to_numpy().astype(np.int32)
+
+            log.info(
+                "Training LGBMRanker(binary)  |"
+                "  samples=%d  positives=%d  features=%d",
+                len(y), int(y.sum()), len(self.feature_cols),
+            )
+
+            self._model = lgb.LGBMClassifier(
+                n_estimators=self.n_estimators,
+                learning_rate=self.learning_rate,
+                max_depth=self.max_depth,
+                num_leaves=self.num_leaves,
+                subsample=self.subsample,
+                colsample_bytree=self.colsample,
+                objective="binary",
+                metric="auc",
+                min_child_samples=self.min_child_samples,
+                random_state=self.random_state,
+                n_jobs=self.n_jobs,
+                verbose=-1,
+            )
+            self._model.fit(X, y)
+
         log.info("LGBMRanker trained.")
 
     # ── Predict ───────────────────────────────────────────────────────────────
 
     def predict_proba(self, df: pl.DataFrame) -> np.ndarray:
-        """Return predicted purchase probability for each row."""
+        """
+        Return a ranking score for each row.
+
+        For ``lambdarank`` mode the score is a raw LambdaMART output (higher =
+        more relevant).  For ``binary`` mode it is the positive-class
+        probability.  Both are suitable for sorting within a user group.
+        """
         if self._model is None:
             raise RuntimeError("Model not fitted. Call fit() first.")
         if df.height == 0:
@@ -117,13 +176,17 @@ class LGBMRanker:
         X = df.select(self.feature_cols).to_numpy().astype(np.float32)
         if X.shape[0] == 0:
             return np.array([], dtype=np.float32)
+        try:
+            import lightgbm as lgb
+        except ImportError:
+            lgb = None  # type: ignore
         with warnings.catch_warnings():
-            warnings.filterwarnings(
-                "ignore",
-                message="X does not have valid feature names, but LGBMClassifier was fitted with feature names",
-                category=UserWarning,
-            )
-            return self._model.predict_proba(X)[:, 1]
+            warnings.filterwarnings("ignore", category=UserWarning)
+            if lgb is not None and isinstance(self._model, lgb.LGBMRanker):
+                # LambdaMART returns raw scores (not probabilities)
+                return self._model.predict(X).astype(np.float32)
+            else:
+                return self._model.predict_proba(X)[:, 1].astype(np.float32)
 
     def rank(
         self,

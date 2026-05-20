@@ -129,22 +129,24 @@ def candidates_to_dataframe(
 ) -> pl.DataFrame:
     """
     Flatten the candidate dict into a (customer_id, item_id) DataFrame
-    with binary source flags used as cross features.
+    with binary source flags and stage-1 rank used as cross features.
 
-    Columns: customer_id, item_id, from_history, from_covisit, from_w2v
+    Columns: customer_id, item_id, from_history, from_covisit, from_w2v,
+             stage1_rank
     """
     rows = []
     for uid, res in candidate_results.items():
         hist_set    = set(res["history"])
         covisit_set = set(res["covisit"])
         w2v_set     = set(res["w2v"])
-        for item in res["all_candidates"]:
+        for rank, item in enumerate(res["all_candidates"], start=1):
             rows.append((
                 uid,
                 item,
                 int(item in hist_set),
                 int(item in covisit_set),
                 int(item in w2v_set),
+                rank,
             ))
 
     return pl.DataFrame(
@@ -155,6 +157,7 @@ def candidates_to_dataframe(
             "from_history":  pl.Int8,
             "from_covisit":  pl.Int8,
             "from_w2v":      pl.Int8,
+            "stage1_rank":   pl.Int32,
         },
         orient="row",
     )

@@ -61,7 +61,8 @@ def build_feature_matrix(
         item_feat = build_item_features(trans_df, items_df)
 
     log.info("Building cross features …")
-    df = build_cross_features(candidates_df, trans_df, covisit_scores, w2v_scores)
+    df = build_cross_features(candidates_df, trans_df, covisit_scores, w2v_scores,
+                              items_df=items_df)
 
     # ── Join user and item features ───────────────────────────────────────────
     df = df.join(user_feat, on="customer_id", how="left")

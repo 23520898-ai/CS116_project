@@ -36,6 +36,7 @@ from src.config import (
     W2V_VECTOR_SIZE, W2V_WINDOW, W2V_MIN_COUNT, W2V_EPOCHS, W2V_WORKERS,
     RANKER_N_ESTIMATORS, RANKER_LEARNING_RATE, RANKER_MAX_DEPTH,
     RANKER_NUM_LEAVES, RANKER_SUBSAMPLE, RANKER_COLSAMPLE,
+    RANKER_OBJECTIVE, RANKER_MIN_CHILD_SAMPLES,
     RANKER_TRAIN_USERS, RANKER_NEG_RATIO, RANKER_TOP_K_OUTPUT,
 )
 from src.data.loader import (
@@ -45,7 +46,7 @@ from src.data.loader import (
 from src.candidates.covisitation  import build_covisitation_matrix, save_covisit, load_covisit
 from src.candidates.word2vec_cands import train_word2vec, build_embedding_matrix, save_w2v_artifacts, load_w2v_artifacts
 from src.ranker.lgbm_ranker        import LGBMRanker
-from src.evaluation.metrics        import evaluate
+from src.evaluation.metrics        import evaluate, compute_pir_metrics
 from src.features.user_features    import build_user_features
 from src.features.item_features    import build_item_features
 
@@ -74,6 +75,9 @@ def parse_args() -> argparse.Namespace:
                    help="Max users for validation evaluation (0 = all available).")
     p.add_argument("--top-k",        type=int,   default=RANKER_TOP_K_OUTPUT)
     p.add_argument("--neg-ratio",    type=int,   default=RANKER_NEG_RATIO)
+    p.add_argument("--ranker-type",  choices=["lambdarank", "binary"],
+                   default=RANKER_OBJECTIVE,
+                   help="Ranker objective: lambdarank (default, recommended) or binary.")
     p.add_argument("--no-w2v",       action="store_true",
                    help="Skip Word2Vec (faster, lower recall)")
     p.add_argument("--skip-stage1",  action="store_true",
@@ -247,6 +251,8 @@ def main() -> None:
         num_leaves    = RANKER_NUM_LEAVES,
         subsample     = RANKER_SUBSAMPLE,
         colsample     = RANKER_COLSAMPLE,
+        objective     = args.ranker_type,
+        min_child_samples = RANKER_MIN_CHILD_SAMPLES,
     )
     log.info("Training LGBMRanker …")
     t0 = time.time()
@@ -313,11 +319,24 @@ def main() -> None:
         metrics = evaluate(preds, trans_val, k=args.top_k)
 
         print("── Validation metrics ──────────────────────────────────────────")
+        pir_keys = ["precision_at_10", "map", "iou", "reciprocal_rank_first_hit",
+                    "total_correct_recommendations"]
+        print("  [ PIR / competition metrics ]")
+        for k in pir_keys:
+            if k in metrics:
+                v = metrics[k]
+                if isinstance(v, float):
+                    print(f"  {k:35s}: {v:.6f}")
+                else:
+                    print(f"  {k:35s}: {v:,}")
+        print("  [ additional ranking metrics ]")
         for name, val in metrics.items():
+            if name in pir_keys:
+                continue
             if isinstance(val, float):
-                print(f"  {name:25s}: {val:.4f}")
+                print(f"  {name:35s}: {val:.4f}")
             else:
-                print(f"  {name:25s}: {val:,}")
+                print(f"  {name:35s}: {val:,}")
         print("────────────────────────────────────────────────────────────────\n")
 
         OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
