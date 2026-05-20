@@ -1,0 +1,18 @@
+# Core data processing
+polars>=0.20
+numpy>=1.26
+scipy>=1.12
+
+# ── Single-stage baseline ─────────────────────────────────────────────────────
+# Collaborative filtering (ALS)
+implicit>=0.7
+
+# ── Two-stage system ──────────────────────────────────────────────────────────
+# Lưới 3 – Word2Vec deep embeddings
+gensim>=4.3
+
+# Stage 2 – LightGBM reranker
+lightgbm>=4.0
+
+# Feature engineering / utilities
+scikit-learn>=1.4
