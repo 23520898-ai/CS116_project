@@ -16,3 +16,6 @@ lightgbm>=4.0
 
 # Feature engineering / utilities
 scikit-learn>=1.4
+
+# Hyperparameter tuning
+optuna>=3.5

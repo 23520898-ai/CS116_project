@@ -149,6 +149,102 @@ def get_covisit_candidates(
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 
+def build_covisit_sparse(
+    covisit: dict[str, list[tuple[str, float]]],
+) -> tuple["sp.csr_matrix", list[str], dict[str, int]]:
+    """
+    Convert the covisit dict to a CSR sparse matrix for vectorised batch lookups.
+
+    Returns
+    -------
+    mat         : scipy CSR sparse matrix  (n_items × n_items)
+    item_list   : sorted list of all item ids (row / column index)
+    item_to_idx : item_id → row/col index in mat
+    """
+    all_items: set[str] = set(covisit.keys())
+    for neighbors in covisit.values():
+        for item, _ in neighbors:
+            all_items.add(item)
+
+    item_list_sorted = sorted(all_items)
+    item_to_idx: dict[str, int] = {item: i for i, item in enumerate(item_list_sorted)}
+
+    rows, cols, data = [], [], []
+    for item, neighbors in covisit.items():
+        i = item_to_idx[item]
+        for neighbor, score in neighbors:
+            j = item_to_idx[neighbor]
+            rows.append(i)
+            cols.append(j)
+            data.append(score)
+
+    n = len(item_list_sorted)
+    mat = sp.csr_matrix(
+        (np.array(data, dtype=np.float32), (rows, cols)),
+        shape=(n, n),
+    )
+    log.info("Covisit sparse: %d items, %d non-zeros", n, mat.nnz)
+    return mat, item_list_sorted, item_to_idx
+
+
+def get_covisit_candidates_batch(
+    user_history_list: list[list[str]],
+    covisit_sparse:    "sp.csr_matrix",
+    item_to_idx:       dict[str, int],
+    item_arr:          np.ndarray,
+    n_candidates:      int = 300,
+    history_sets:      list[set[str]] | None = None,
+) -> list[tuple[list[str], dict[str, float]]]:
+    """
+    Batch covisitation candidates using sparse matrix row-sum operations.
+
+    For each user the aggregated covisit score vector is computed as the sum
+    of the rows in ``covisit_sparse`` that correspond to the user's history
+    items.  This replaces the Python dict accumulation loop in
+    ``get_covisit_candidates`` and is significantly faster for large batches.
+
+    Returns
+    -------
+    list of (candidates, scores) tuples, one per user (same order as input).
+    """
+    results: list[tuple[list[str], dict[str, float]]] = []
+
+    for i, history in enumerate(user_history_list):
+        hist_indices = [item_to_idx[it] for it in history if it in item_to_idx]
+        if not hist_indices:
+            results.append(([], {}))
+            continue
+
+        # Sum rows from sparse matrix → dense 1-D score vector
+        scores_vec: np.ndarray = np.asarray(
+            covisit_sparse[hist_indices].sum(axis=0)
+        ).flatten()
+
+        # Zero out history items to avoid re-recommending them
+        hs = (history_sets[i] if history_sets else None) or set()
+        for it in hs:
+            if it in item_to_idx:
+                scores_vec[item_to_idx[it]] = 0.0
+
+        nonzero_count = int((scores_vec > 0).sum())
+        if nonzero_count == 0:
+            results.append(([], {}))
+            continue
+
+        n_top = min(n_candidates, nonzero_count)
+        top_idx = np.argpartition(scores_vec, -n_top)[-n_top:]
+        top_idx = top_idx[np.argsort(scores_vec[top_idx])[::-1]]
+        top_idx = top_idx[scores_vec[top_idx] > 0]
+
+        candidates = item_arr[top_idx].tolist()
+        scores_dict = {item_arr[int(j)]: float(scores_vec[j]) for j in top_idx}
+        results.append((candidates, scores_dict))
+
+    return results
+
+
+# ── Persistence ───────────────────────────────────────────────────────────────
+
 def save_covisit(covisit: dict, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "wb") as fh:

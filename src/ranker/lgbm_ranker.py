@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import pickle
+import time
 import warnings
 from pathlib import Path
 from typing import Any
@@ -112,11 +113,18 @@ class LGBMRanker:
                 "  samples=%d  positives=%d  features=%d  groups=%d",
                 len(y), int(y.sum()), len(self.feature_cols), len(groups),
             )
+            log.info(
+                "LambdaRanker params: n_est=%d  lr=%.4f  depth=%d  leaves=%d  "
+                "sub=%.2f  col=%.2f  min_child=%d",
+                self.n_estimators, self.learning_rate, self.max_depth,
+                self.num_leaves, self.subsample, self.colsample,
+                self.min_child_samples,
+            )
 
             self._model = lgb.LGBMRanker(
                 objective="lambdarank",
                 metric="ndcg",
-                ndcg_eval_at=[10],
+                eval_at=[10],   # was ndcg_eval_at – renamed in LightGBM ≥ 4.0
                 n_estimators=self.n_estimators,
                 learning_rate=self.learning_rate,
                 max_depth=self.max_depth,
@@ -173,20 +181,37 @@ class LGBMRanker:
             raise RuntimeError("Model not fitted. Call fit() first.")
         if df.height == 0:
             return np.array([], dtype=np.float32)
+        _t0 = time.perf_counter()
         X = df.select(self.feature_cols).to_numpy().astype(np.float32)
+        _t1 = time.perf_counter()
         if X.shape[0] == 0:
             return np.array([], dtype=np.float32)
         try:
             import lightgbm as lgb
         except ImportError:
             lgb = None  # type: ignore
+        # Inference-time tree truncation: using fewer trees cuts predict time
+        # proportionally with minimal quality loss for well-converged models.
+        try:
+            from src.config import RANKER_PREDICT_NUM_ITERATION as _N_ITER
+        except Exception:
+            _N_ITER = None
+
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", category=UserWarning)
             if lgb is not None and isinstance(self._model, lgb.LGBMRanker):
-                # LambdaMART returns raw scores (not probabilities)
-                return self._model.predict(X).astype(np.float32)
+                result = self._model.booster_.predict(
+                    X, num_threads=-1, num_iteration=_N_ITER
+                ).astype(np.float32)
             else:
-                return self._model.predict_proba(X)[:, 1].astype(np.float32)
+                result = self._model.predict_proba(X)[:, 1].astype(np.float32)
+        _t2 = time.perf_counter()
+        if _t2 - _t0 > 1.0:   # only log when it matters
+            log.info(
+                "  [ranker] to_numpy=%.1fs  predict=%.1fs  rows=%d  cols=%d",
+                _t1 - _t0, _t2 - _t1, X.shape[0], X.shape[1],
+            )
+        return result
 
     def rank(
         self,

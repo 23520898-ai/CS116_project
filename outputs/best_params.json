@@ -1,0 +1,30 @@
+{
+  "best_precision_at_10": 0.368708,
+  "params": {
+    "n_estimators": 1600,
+    "learning_rate": 0.012271453768055265,
+    "max_depth": 12,
+    "num_leaves": 192,
+    "subsample": 0.6282572457368231,
+    "colsample_bytree": 0.9183989229973636,
+    "min_child_samples": 23
+  },
+  "study_name": "twostage_ranker_v2",
+  "n_trials_completed": 20,
+  "n_trials_pruned": 10,
+  "n_trials_failed": 0,
+  "total_time_seconds": 2421.6199808120728,
+  "timestamp": "2026-05-21 17:17:29",
+  "ranker_params_supported": [
+    "colsample",
+    "learning_rate",
+    "max_depth",
+    "min_child_samples",
+    "n_estimators",
+    "n_jobs",
+    "num_leaves",
+    "objective",
+    "random_state",
+    "subsample"
+  ]
+}

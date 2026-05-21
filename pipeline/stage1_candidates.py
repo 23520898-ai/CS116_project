@@ -24,8 +24,8 @@ import numpy as np
 import polars as pl
 
 from src.candidates.history      import get_history_candidates
-from src.candidates.covisitation import get_covisit_candidates
-from src.candidates.word2vec_cands import get_w2v_candidates
+from src.candidates.covisitation import get_covisit_candidates, build_covisit_sparse, get_covisit_candidates_batch
+from src.candidates.word2vec_cands import get_w2v_candidates, get_w2v_candidates_batch
 from src.config import (
     HISTORY_MAX_ITEMS, COVISIT_CANDS, W2V_CANDS,
     W2V_RECENT, MAX_CANDIDATES,
@@ -129,16 +129,19 @@ def candidates_to_dataframe(
 ) -> pl.DataFrame:
     """
     Flatten the candidate dict into a (customer_id, item_id) DataFrame
-    with binary source flags and stage-1 rank used as cross features.
+    with binary source flags, stage-1 rank, and pre-joined covisit / w2v
+    scores (avoids a separate dict→DataFrame conversion + join in Stage 2).
 
     Columns: customer_id, item_id, from_history, from_covisit, from_w2v,
-             stage1_rank
+             stage1_rank, ui_covisit_score, ui_w2v_score
     """
     rows = []
     for uid, res in candidate_results.items():
         hist_set    = set(res["history"])
         covisit_set = set(res["covisit"])
         w2v_set     = set(res["w2v"])
+        cov_scores  = res.get("covisit_scores", {})
+        w2v_scores  = res.get("w2v_scores", {})
         for rank, item in enumerate(res["all_candidates"], start=1):
             rows.append((
                 uid,
@@ -147,17 +150,142 @@ def candidates_to_dataframe(
                 int(item in covisit_set),
                 int(item in w2v_set),
                 rank,
+                float(cov_scores.get(item, 0.0)),
+                float(w2v_scores.get(item, 0.0)),
             ))
 
     return pl.DataFrame(
         rows,
         schema={
-            "customer_id": pl.Int32,
-            "item_id":     pl.Utf8,
-            "from_history":  pl.Int8,
-            "from_covisit":  pl.Int8,
-            "from_w2v":      pl.Int8,
-            "stage1_rank":   pl.Int32,
+            "customer_id":      pl.Int32,
+            "item_id":          pl.Utf8,
+            "from_history":     pl.Int8,
+            "from_covisit":     pl.Int8,
+            "from_w2v":         pl.Int8,
+            "stage1_rank":      pl.Int32,
+            "ui_covisit_score": pl.Float32,
+            "ui_w2v_score":     pl.Float32,
         },
         orient="row",
     )
+
+
+def generate_candidates_for_users_fast(
+    user_ids:       list[int],
+    trans_df:       pl.DataFrame,
+    covisit:        dict[str, list[tuple[str, float]]],
+    w2v_model:      Any,
+    emb_matrix:     np.ndarray | None,
+    item_list:      list[str] | None,
+    max_candidates: int = MAX_CANDIDATES,
+    allowed_items:  set[str] | None = None,
+    _prebuilt_covisit_sparse: tuple | None = None,
+    _item_to_emb_idx:         dict[str, int] | None = None,
+) -> dict[int, CandidateResult]:
+    """
+    Drop-in replacement for ``generate_candidates_for_users`` using vectorised
+    batch operations for both covisitation and Word2Vec.
+
+    Key differences vs. the original:
+    - Covisitation uses scipy sparse row-sum instead of Python dict accumulation.
+    - W2V uses a single batched matrix multiply (user_vecs @ emb_matrix.T) for
+      all users at once instead of per-user dot products.
+
+    Parameters
+    ----------
+    _prebuilt_covisit_sparse : optional pre-built (sparse_mat, item_list, item_to_idx)
+        from ``build_covisit_sparse``.  Pass this when calling from a loop to
+        avoid rebuilding the sparse matrix every batch.
+    _item_to_emb_idx : optional pre-built {item_id: emb_row} mapping.
+        Pass this together with *_prebuilt_covisit_sparse* for maximum speed.
+    """
+    # ── History (vectorised via polars) ───────────────────────────────────────
+    history_map = get_history_candidates(
+        trans_df.filter(pl.col("customer_id").is_in(user_ids)),
+        max_items=HISTORY_MAX_ITEMS,
+    )
+
+    user_histories: list[list[str]] = []
+    for uid in user_ids:
+        history = history_map.get(uid, [])
+        if allowed_items is not None:
+            history = [it for it in history if it in allowed_items]
+        user_histories.append(history)
+
+    history_sets = [set(h) for h in user_histories]
+
+    # ── Covisitation (sparse matrix batch) ───────────────────────────────────
+    if _prebuilt_covisit_sparse is not None:
+        cov_sparse, cov_item_list, cov_item_to_idx = _prebuilt_covisit_sparse
+    else:
+        cov_sparse, cov_item_list, cov_item_to_idx = build_covisit_sparse(covisit)
+
+    cov_item_arr = np.array(cov_item_list)
+    covisit_results = get_covisit_candidates_batch(
+        user_history_list=user_histories,
+        covisit_sparse=cov_sparse,
+        item_to_idx=cov_item_to_idx,
+        item_arr=cov_item_arr,
+        n_candidates=COVISIT_CANDS,
+        history_sets=history_sets,
+    )
+    if allowed_items is not None:
+        covisit_results = [
+            (
+                [it for it in cands if it in allowed_items],
+                {k: v for k, v in scores.items() if k in allowed_items},
+            )
+            for cands, scores in covisit_results
+        ]
+
+    # ── Word2Vec (batched matmul) ─────────────────────────────────────────────
+    if w2v_model is not None and emb_matrix is not None and item_list is not None:
+        if _item_to_emb_idx is None:
+            _item_to_emb_idx = {item: i for i, item in enumerate(item_list)}
+
+        w2v_results = get_w2v_candidates_batch(
+            user_history_list=user_histories,
+            emb_matrix=emb_matrix,
+            item_list=item_list,
+            item_to_emb_idx=_item_to_emb_idx,
+            n_candidates=W2V_CANDS,
+            history_sets=history_sets,
+            n_recent=W2V_RECENT,
+        )
+        if allowed_items is not None:
+            w2v_results = [
+                (
+                    [it for it in cands if it in allowed_items],
+                    {k: v for k, v in scores.items() if k in allowed_items},
+                )
+                for cands, scores in w2v_results
+            ]
+    else:
+        w2v_results = [([], {})] * len(user_ids)
+
+    # ── Assemble per-user results ─────────────────────────────────────────────
+    results: dict[int, CandidateResult] = {}
+    for i, uid in enumerate(user_ids):
+        history = user_histories[i]
+        cov_cands, cov_scores = covisit_results[i]
+        w2v_cands, w2v_sim = w2v_results[i]
+
+        seen: set[str] = set()
+        all_cands: list[str] = []
+        for item in history + cov_cands + w2v_cands:
+            if item not in seen:
+                seen.add(item)
+                all_cands.append(item)
+            if len(all_cands) >= max_candidates:
+                break
+
+        results[uid] = {
+            "history":        history,
+            "covisit":        cov_cands,
+            "w2v":            w2v_cands,
+            "all_candidates": all_cands,
+            "covisit_scores": cov_scores,
+            "w2v_scores":     w2v_sim,
+        }
+
+    return results

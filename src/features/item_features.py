@@ -1,7 +1,12 @@
 """Item-side features computed from training transactions + items metadata."""
 from __future__ import annotations
 
+import logging
+import time
+
 import polars as pl
+
+log = logging.getLogger(__name__)
 
 
 def build_item_features(
@@ -93,3 +98,120 @@ def build_item_features(
     ])
 
     return base.join(meta, on="item_id", how="left")
+
+
+# ── Improvement 8: Item Popularity Trend Features ────────────────────────────
+
+def build_item_trend_features(
+    trans_df: pl.DataFrame,
+    windows: list[int] | None = None,
+) -> pl.DataFrame:
+    """
+    Compute multi-window popularity trend features per item.
+
+    For each window W (default: 7, 30, 90 days):
+      i_pop_last_Wd     : purchase count in last W days
+      i_pop_prev_Wd     : purchase count in the W days before that
+      i_trend_ratio_Wd  : recent / previous  (> 1 = trending up)
+
+    Derived:
+      i_trend_acceleration  : trend_7d / trend_30d  (short vs medium momentum)
+      i_volatility          : std of monthly purchase counts
+      i_n_active_months     : months with at least one sale
+      i_seasonal_score      : peak-month count / mean monthly count
+
+    Why effective
+    -------------
+    Static popularity ignores direction.  A rising item should rank above a
+    stagnant one with the same total purchases.  Seasonal items need to be
+    recommended at the right time.
+
+    Returns
+    -------
+    DataFrame keyed by item_id with trend feature columns.
+    """
+    if windows is None:
+        windows = [7, 30, 90]
+    t0 = time.perf_counter()
+    ref = trans_df["updated_date"].max()
+
+    result = trans_df.select("item_id").unique()
+
+    for w in windows:
+        cutoff_recent = ref - pl.duration(days=w)
+        cutoff_prev   = ref - pl.duration(days=w * 2)
+
+        recent = (
+            trans_df.filter(pl.col("updated_date") >= cutoff_recent)
+            .group_by("item_id")
+            .agg(pl.len().cast(pl.Float32).alias(f"i_pop_last_{w}d"))
+        )
+        previous = (
+            trans_df.filter(
+                (pl.col("updated_date") >= cutoff_prev)
+                & (pl.col("updated_date") < cutoff_recent)
+            )
+            .group_by("item_id")
+            .agg(pl.len().cast(pl.Float32).alias(f"i_pop_prev_{w}d"))
+        )
+        result = (
+            result
+            .join(recent,   on="item_id", how="left")
+            .join(previous, on="item_id", how="left")
+            .with_columns([
+                pl.col(f"i_pop_last_{w}d").fill_null(0.0),
+                pl.col(f"i_pop_prev_{w}d").fill_null(0.0),
+            ])
+            .with_columns([
+                (pl.col(f"i_pop_last_{w}d") / (pl.col(f"i_pop_prev_{w}d") + 1e-6))
+                .cast(pl.Float32).alias(f"i_trend_ratio_{w}d"),
+            ])
+        )
+
+    # Trend acceleration: short-term vs medium-term momentum
+    if 7 in windows and 30 in windows:
+        result = result.with_columns([
+            (pl.col("i_trend_ratio_7d") / (pl.col("i_trend_ratio_30d") + 1e-6))
+            .cast(pl.Float32).alias("i_trend_acceleration"),
+        ])
+
+    # Monthly stats: volatility and seasonal score
+    monthly = (
+        trans_df
+        .with_columns(pl.col("updated_date").dt.month().alias("_month"))
+        .group_by(["item_id", "_month"])
+        .agg(pl.len().cast(pl.Float32).alias("_mc"))
+    )
+    volatility = (
+        monthly.group_by("item_id").agg([
+            pl.col("_mc").std().fill_null(0.0).cast(pl.Float32).alias("i_volatility"),
+            pl.col("_month").n_unique().cast(pl.Float32).alias("i_n_active_months"),
+        ])
+    )
+    seasonal = (
+        monthly.group_by("item_id").agg([
+            pl.col("_mc").max().alias("_peak"),
+            pl.col("_mc").mean().alias("_avg"),
+        ])
+        .with_columns([
+            (pl.col("_peak") / (pl.col("_avg") + 1e-6)).cast(pl.Float32).alias("i_seasonal_score"),
+        ])
+        .select(["item_id", "i_seasonal_score"])
+    )
+
+    result = (
+        result
+        .join(volatility, on="item_id", how="left")
+        .join(seasonal,   on="item_id", how="left")
+    )
+
+    # Fill remaining nulls
+    for c in result.columns:
+        if c != "item_id":
+            result = result.with_columns(pl.col(c).fill_null(0.0))
+
+    log.info(
+        "Item trend features: %d items  %d features  [%.1fs]",
+        len(result), result.width - 1, time.perf_counter() - t0,
+    )
+    return result

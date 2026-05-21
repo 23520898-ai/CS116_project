@@ -156,6 +156,96 @@ def get_w2v_candidates(
     return candidates, similarities
 
 
+def get_w2v_candidates_batch(
+    user_history_list: list[list[str]],
+    emb_matrix:        np.ndarray,
+    item_list:         list[str],
+    item_to_emb_idx:   dict[str, int] | None = None,
+    n_candidates:      int = 200,
+    history_sets:      list[set[str]] | None = None,
+    n_recent:          int = 20,
+) -> list[tuple[list[str], dict[str, float]]]:
+    """
+    Batch version of ``get_w2v_candidates`` using a single matrix multiply.
+
+    All user query vectors are stacked into a (n_valid_users × dim) matrix,
+    then scored against the full item embedding matrix in one BLAS call:
+        sims_batch = user_vecs @ emb_matrix.T   # (n_valid, n_items)
+
+    This is significantly faster than calling ``get_w2v_candidates`` in a
+    Python loop when the batch contains many users.
+
+    Parameters
+    ----------
+    user_history_list : list of per-user history item lists
+    emb_matrix        : L2-normalised item embeddings (from build_embedding_matrix)
+    item_list         : item_id for each row of emb_matrix
+    item_to_emb_idx   : pre-built {item_id: row_index} mapping (optional, built if None)
+    n_candidates      : max candidates returned per user
+    history_sets      : per-user sets of already-purchased items (to exclude)
+    n_recent          : how many recent history items to form the user query vector
+
+    Returns
+    -------
+    list of (candidates, similarities) tuples, one per user, same order as input.
+    """
+    if item_to_emb_idx is None:
+        item_to_emb_idx = {item: i for i, item in enumerate(item_list)}
+
+    item_arr = np.array(item_list)
+    n_users = len(user_history_list)
+    dim = emb_matrix.shape[1]
+
+    user_vecs = np.zeros((n_users, dim), dtype=np.float32)
+    valid_mask = np.zeros(n_users, dtype=bool)
+
+    for i, history in enumerate(user_history_list):
+        query_items = [it for it in history[:n_recent] if it in item_to_emb_idx]
+        if not query_items:
+            continue
+
+        query_indices = [item_to_emb_idx[it] for it in query_items]
+        # emb_matrix rows are L2-normalised (from build_embedding_matrix)
+        query_vecs = emb_matrix[query_indices]  # (n_query, dim)
+
+        weights = np.power(0.9, np.arange(len(query_items), dtype=np.float32))
+        weights /= weights.sum()
+        user_vec = (weights[:, None] * query_vecs).sum(axis=0)
+
+        norm = float(np.linalg.norm(user_vec))
+        if norm > 0:
+            user_vecs[i] = user_vec / norm
+            valid_mask[i] = True
+
+    results: list[tuple[list[str], dict[str, float]]] = [([], {}) for _ in range(n_users)]
+    valid_indices = np.where(valid_mask)[0]
+    if len(valid_indices) == 0:
+        return results
+
+    # Single batched cosine-similarity multiply
+    # emb_matrix is L2-normalised → dot product == cosine similarity
+    sims_batch: np.ndarray = user_vecs[valid_indices] @ emb_matrix.T  # (n_valid, n_items)
+
+    for batch_pos, user_i in enumerate(valid_indices):
+        sims = sims_batch[batch_pos].copy()
+
+        hs = (history_sets[int(user_i)] if history_sets else None) or set()
+        for it in hs:
+            if it in item_to_emb_idx:
+                sims[item_to_emb_idx[it]] = -np.inf
+
+        n_top = min(n_candidates, len(sims))
+        top_idx = np.argpartition(sims, -n_top)[-n_top:]
+        top_idx = top_idx[np.argsort(sims[top_idx])[::-1]]
+        valid_top = top_idx[sims[top_idx] > -np.inf]
+
+        candidates = item_arr[valid_top].tolist()
+        similarities = {item_arr[int(j)]: float(sims[j]) for j in valid_top}
+        results[int(user_i)] = (candidates, similarities)
+
+    return results
+
+
 # ── Persistence ───────────────────────────────────────────────────────────────
 
 def save_w2v_artifacts(

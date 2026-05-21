@@ -1,31 +1,14 @@
 #!/usr/bin/env bash
-# =============================================================================
-# run_pipeline.sh — End-to-end two-stage recommendation pipeline
-# =============================================================================
-#
-# Usage:
-#   bash run_pipeline.sh                  # full retrain + Jan-2026 prediction
-#   bash run_pipeline.sh --skip-stage1    # reuse covisit/w2v, retrain ranker only
-#   bash run_pipeline.sh --eval           # retrain on train-split, eval on val
-#   bash run_pipeline.sh --target val     # predict & evaluate validation month
-#
-# Environment variable overrides (set before calling the script):
-#   WORKERS=12         CPU threads for training / inference (default: 12)
-#   N_USERS=100000     Training users for ranker (default: 100 000)
-#   BATCH_SIZE=3000    Users per Stage-1 batch   (default: 3 000)
-#   EVAL_USERS=10000   Users for val-set metrics (default: 10 000)
-#   RANKER_TYPE=lambdarank   "lambdarank" or "binary"  (default: lambdarank)
-#   NEG_RATIO=20       Negatives per positive in training (default: 20)
-#
-# Requirements:
-#   - uv installed  (https://docs.astral.sh/uv/)  — OR — pip + virtualenv
-#   - parquet data files in project root (see README §4)
-#   - Run from project root:  bash run_pipeline.sh
-# =============================================================================
-
 set -euo pipefail
 
-# ── Defaults (override via env vars) ─────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# Recommendation Pipeline Runner
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# ── Defaults ──────────────────────────────────────────────────────────────────
 WORKERS="${WORKERS:-12}"
 N_USERS="${N_USERS:-100000}"
 BATCH_SIZE="${BATCH_SIZE:-3000}"
@@ -33,121 +16,156 @@ EVAL_USERS="${EVAL_USERS:-10000}"
 RANKER_TYPE="${RANKER_TYPE:-lambdarank}"
 NEG_RATIO="${NEG_RATIO:-20}"
 
-# ── Parse CLI flags ───────────────────────────────────────────────────────────
-SKIP_STAGE1=0      # --skip-stage1  : reuse existing covisit + w2v artifacts
-DO_EVAL=0          # --eval         : train on months 1-10, evaluate on month 11
-TARGET_SPLIT="jan2026"  # --target <val|test|jan2026>
+# ── Feature Improvement Flags (set to 1 to enable) ────────────────────────────
+EXTEND_LABELS="${EXTEND_LABELS:-0}"
+USE_HARD_NEGATIVES="${USE_HARD_NEGATIVES:-0}"
+USE_TEMPORAL="${USE_TEMPORAL:-0}"
+USE_SESSION="${USE_SESSION:-0}"
+USE_CATEGORY_AFFINITY="${USE_CATEGORY_AFFINITY:-0}"
+USE_ITEM_TRENDS="${USE_ITEM_TRENDS:-0}"
+USE_UI_HISTORY="${USE_UI_HISTORY:-0}"
+ENSEMBLE_SEEDS="${ENSEMBLE_SEEDS:-}"      # e.g. "42,123,456"
+ENSEMBLE_METHOD="${ENSEMBLE_METHOD:-reciprocal_rank}"
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --skip-stage1)  SKIP_STAGE1=1 ;;
-        --eval)         DO_EVAL=1 ;;
-        --target)       shift; TARGET_SPLIT="$1" ;;
-        --workers)      shift; WORKERS="$1" ;;
-        --n-users)      shift; N_USERS="$1" ;;
-        --batch-size)   shift; BATCH_SIZE="$1" ;;
-        --ranker-type)  shift; RANKER_TYPE="$1" ;;
-        --neg-ratio)    shift; NEG_RATIO="$1" ;;
-        -h|--help)
-            sed -n '2,30p' "$0" | grep '^#' | sed 's/^# \{0,2\}//'
-            exit 0 ;;
-        *) echo "Unknown option: $1" >&2; exit 1 ;;
+MODE="full"
+SKIP_STAGE1=false
+EVAL_MODE=false
+
+# ── Parse args ────────────────────────────────────────────────────────────────
+for arg in "$@"; do
+    case "$arg" in
+        --skip-stage1)           SKIP_STAGE1=true ;;
+        --eval)                  EVAL_MODE=true ;;
+        --extend-labels)         EXTEND_LABELS=1 ;;
+        --use-hard-negatives)    USE_HARD_NEGATIVES=1 ;;
+        --use-temporal)          USE_TEMPORAL=1 ;;
+        --use-session)           USE_SESSION=1 ;;
+        --use-category-affinity) USE_CATEGORY_AFFINITY=1 ;;
+        --use-item-trends)       USE_ITEM_TRENDS=1 ;;
+        --use-ui-history)        USE_UI_HISTORY=1 ;;
+        --all-features)
+            EXTEND_LABELS=1; USE_HARD_NEGATIVES=1; USE_TEMPORAL=1
+            USE_SESSION=1; USE_CATEGORY_AFFINITY=1; USE_ITEM_TRENDS=1; USE_UI_HISTORY=1 ;;
+        *)                       echo "Unknown arg: $arg"; exit 1 ;;
     esac
-    shift
 done
 
-# ── Detect Python runner ──────────────────────────────────────────────────────
-if command -v uv &>/dev/null; then
-    PY="uv run python"
-elif [[ -f ".venv/Scripts/python" ]]; then
-    PY=".venv/Scripts/python"
-elif [[ -f ".venv/bin/python" ]]; then
-    PY=".venv/bin/python"
+# ── Print configuration ───────────────────────────────────────────────────────
+echo "════════════════════════════════════════════════════════════════════"
+echo " Recommendation Pipeline"
+echo "════════════════════════════════════════════════════════════════════"
+echo " Workers:              $WORKERS"
+echo " Train users:          $N_USERS"
+echo " Batch size:           $BATCH_SIZE"
+echo " Ranker type:          $RANKER_TYPE"
+echo " Neg ratio:            $NEG_RATIO"
+echo " Skip Stage1:          $SKIP_STAGE1"
+echo " Eval mode:            $EVAL_MODE"
+echo " --- Feature Improvements ---"
+echo " Extend labels:        $EXTEND_LABELS"
+echo " Hard negatives:       $USE_HARD_NEGATIVES"
+echo " Temporal features:    $USE_TEMPORAL"
+echo " Session features:     $USE_SESSION"
+echo " Category affinity:    $USE_CATEGORY_AFFINITY"
+echo " Item trends:          $USE_ITEM_TRENDS"
+echo " UI history:           $USE_UI_HISTORY"
+echo " Ensemble seeds:       ${ENSEMBLE_SEEDS:-none}"
+echo "════════════════════════════════════════════════════════════════════"
+
+# Check required data files
+for f in transaction_full_2025.parquet event_full_2025.parquet items.parquet; do
+    if [[ ! -f "$f" ]]; then
+        echo "ERROR: Missing required file: $f"
+        exit 1
+    fi
+done
+
+echo "✓ All required data files found"
+
+# ── Build train command ───────────────────────────────────────────────────────
+TRAIN_CMD="uv run python train_twostage.py \
+    --n-users $N_USERS \
+    --stage1-batch-size $BATCH_SIZE \
+    --w2v-workers $WORKERS \
+    --ranker-type $RANKER_TYPE \
+    --neg-ratio $NEG_RATIO \
+    --eval-max-users $EVAL_USERS \
+    --ensemble-method $ENSEMBLE_METHOD"
+
+[[ "$EXTEND_LABELS"       == "1" ]] && TRAIN_CMD+=" --extend-labels"
+[[ "$USE_HARD_NEGATIVES"  == "1" ]] && TRAIN_CMD+=" --use-hard-negatives"
+[[ "$USE_TEMPORAL"        == "1" ]] && TRAIN_CMD+=" --use-temporal-features"
+[[ "$USE_SESSION"         == "1" ]] && TRAIN_CMD+=" --use-session-features"
+[[ "$USE_CATEGORY_AFFINITY" == "1" ]] && TRAIN_CMD+=" --use-category-affinity"
+[[ "$USE_ITEM_TRENDS"     == "1" ]] && TRAIN_CMD+=" --use-item-trends"
+[[ "$USE_UI_HISTORY"      == "1" ]] && TRAIN_CMD+=" --use-ui-history"
+[[ -n "$ENSEMBLE_SEEDS"         ]] && TRAIN_CMD+=" --ensemble-seeds $ENSEMBLE_SEEDS"
+$SKIP_STAGE1 && TRAIN_CMD+=" --skip-stage1"
+
+# ── Train ─────────────────────────────────────────────────────────────────────
+if $EVAL_MODE; then
+    echo ""
+    echo ">>> Training with validation evaluation..."
+    $TRAIN_CMD
 else
-    PY="python"
-fi
-echo "[pipeline] Python runner: $PY"
+    echo ""
+    echo ">>> Training for final prediction (Jan 2026)..."
+    $TRAIN_CMD --final-2025 --no-eval
 
-# ── Helper: timestamped log line ──────────────────────────────────────────────
-log() { echo "[$(date '+%H:%M:%S')] $*"; }
-hr()  { echo "────────────────────────────────────────────────────────────────"; }
+    # ── Validate training artifacts ───────────────────────────────────────────
+    echo ""
+    echo ">>> Validating training artifacts..."
+    REQUIRED_ARTIFACTS=(
+        "outputs/checkpoints/covisit.pkl"
+        "outputs/checkpoints/lgbm_ranker.pkl"
+        "outputs/checkpoints/items_df.pkl"
+        "outputs/checkpoints/feature_columns.json"
+    )
 
-# ── Banner ────────────────────────────────────────────────────────────────────
-hr
-log "Two-Stage Recommendation Pipeline"
-log "  workers     = $WORKERS"
-log "  n_users     = $N_USERS"
-log "  batch_size  = $BATCH_SIZE"
-log "  ranker_type = $RANKER_TYPE"
-log "  neg_ratio   = $NEG_RATIO"
-log "  target      = $TARGET_SPLIT"
-[[ $SKIP_STAGE1 -eq 1 ]] && log "  mode        = skip-stage1 (reuse covisit/w2v)"
-[[ $DO_EVAL -eq 1 ]]    && log "  mode        = eval on validation set"
-hr
+    ALL_FOUND=true
+    for artifact in "${REQUIRED_ARTIFACTS[@]}"; do
+        if [[ -f "$artifact" ]]; then
+            echo "  ✓ $artifact"
+        else
+            echo "  ✗ MISSING: $artifact"
+            ALL_FOUND=false
+        fi
+    done
 
-# =============================================================================
-# STEP 1 – TRAIN
-# =============================================================================
-log "STEP 1/2 — Training"
-hr
+    if [[ -f "outputs/checkpoints/w2v/w2v.model" ]]; then
+        echo "  ✓ outputs/checkpoints/w2v/w2v.model"
+    else
+        echo "  ⚠ W2V model not found (may have been skipped)"
+    fi
 
-TRAIN_ARGS=(
-    --n-users        "$N_USERS"
-    --stage1-batch-size "$BATCH_SIZE"
-    --w2v-workers    "$WORKERS"
-    --ranker-type    "$RANKER_TYPE"
-    --neg-ratio      "$NEG_RATIO"
-)
+    if ! $ALL_FOUND; then
+        echo "ERROR: Missing required training artifacts. Training may have failed."
+        exit 1
+    fi
 
-if [[ $SKIP_STAGE1 -eq 1 ]]; then
-    TRAIN_ARGS+=(--skip-stage1)
-fi
+    # ── Predict Jan 2026 ──────────────────────────────────────────────────────
+    echo ""
+    echo ">>> Generating January 2026 predictions..."
+    uv run python predict_twostage.py \
+        --target-split jan2026 \
+        --batch-size $BATCH_SIZE \
+        --workers $WORKERS \
+        --save-every-batches 1
 
-if [[ $DO_EVAL -eq 1 ]]; then
-    # Train on months 1-10, evaluate on month 11
-    TRAIN_ARGS+=(--eval-max-users "$EVAL_USERS")
-    log "Training mode: standard (months 1-10 → ranker → eval on month 11)"
-else
-    # Final mode: use all 12 months of 2025 for prediction
-    TRAIN_ARGS+=(--final-2025 --no-eval)
-    log "Training mode: final-2025 (months 1-11 history, month 12 labels)"
-fi
-
-log "Running: $PY train_twostage.py ${TRAIN_ARGS[*]}"
-$PY train_twostage.py "${TRAIN_ARGS[@]}"
-
-hr
-log "STEP 1/2 — Training complete"
-hr
-
-# =============================================================================
-# STEP 2 – PREDICT
-# =============================================================================
-log "STEP 2/2 — Prediction  (target-split=$TARGET_SPLIT)"
-hr
-
-PRED_ARGS=(
-    --target-split   "$TARGET_SPLIT"
-    --batch-size     "$BATCH_SIZE"
-    --workers        "$WORKERS"
-    --save-every-batches 1
-)
-
-if [[ "$TARGET_SPLIT" == "val" ]]; then
-    PRED_ARGS+=(--quick-metrics)
-    log "Validation split selected — metrics will be reported after prediction."
+    # ── Validate predictions ──────────────────────────────────────────────────
+    PRED_FILE="outputs/predictions/predictions_twostage_jan2026.json"
+    if [[ -f "$PRED_FILE" ]]; then
+        NUM_PREDS=$(python -c "import json; print(len(json.load(open('$PRED_FILE'))))")
+        echo ""
+        echo "✓ Predictions saved: $PRED_FILE"
+        echo "  Users predicted: $NUM_PREDS"
+    else
+        echo "ERROR: Prediction file not found: $PRED_FILE"
+        exit 1
+    fi
 fi
 
-log "Running: $PY predict_twostage.py ${PRED_ARGS[*]}"
-$PY predict_twostage.py "${PRED_ARGS[@]}"
-
-# =============================================================================
-# DONE
-# =============================================================================
-hr
-log "Pipeline finished."
-log "Predictions saved to:  outputs/predictions/predictions_twostage_${TARGET_SPLIT}.json"
-[[ "$TARGET_SPLIT" == "val" ]] && \
-    log "Metrics saved to:      outputs/val_metrics_twostage.json"
-log "Ranker checkpoint:     outputs/checkpoints/lgbm_ranker.pkl"
-hr
+echo ""
+echo "════════════════════════════════════════════════════════════════════"
+echo " Pipeline completed successfully!"
+echo "════════════════════════════════════════════════════════════════════"

@@ -50,16 +50,52 @@ W2V_EPOCHS      = 10
 W2V_WORKERS     = max(1, (os.cpu_count() or 8) - 1)
 
 # ── Stage 2: Reranking ────────────────────────────────────────────────────────
-RANKER_N_ESTIMATORS  = 1000
-RANKER_LEARNING_RATE = 0.05
-RANKER_MAX_DEPTH     = 6
-RANKER_NUM_LEAVES    = 63
-RANKER_SUBSAMPLE     = 0.8
-RANKER_COLSAMPLE     = 0.8
+RANKER_N_ESTIMATORS  = 800
+RANKER_LEARNING_RATE = 0.013173
+RANKER_MAX_DEPTH     = 12
+RANKER_NUM_LEAVES    = 138
+RANKER_PREDICT_NUM_ITERATION = 800
+RANKER_SUBSAMPLE     = 0.5039
+RANKER_COLSAMPLE     = 0.8728
 RANKER_OBJECTIVE     = "lambdarank"   # "lambdarank" (recommended) or "binary"
-RANKER_MIN_CHILD_SAMPLES = 10         # lower than LGBM default (20) for ranking
+RANKER_MIN_CHILD_SAMPLES = 80        # lower than LGBM default (20) for ranking
 RANKER_TOP_K_OUTPUT  = 10   # final output items per user
 
 # Training sampling
 RANKER_TRAIN_USERS = 100_000   # users sampled for ranker training
 RANKER_NEG_RATIO   = 20        # negative samples per positive (for training)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# IMPROVEMENT FLAGS – defaults (can be overridden by CLI flags)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Improvement 2: Extended Labels
+USE_EXTEND_LABELS       = False   # True → use grade-0/1/2 labels for LambdaRank
+SOFT_LABEL_GRADE        = 1       # relevance grade for soft positives (same-cat)
+
+# Improvement 3: Hard Negative Mining
+USE_HARD_NEGATIVES      = False   # True → prioritise hard negs in sampling
+HARD_NEG_FRACTION       = 0.3     # fraction of negative budget for hard negs
+
+# Improvement 4: Temporal Decay Features
+USE_TEMPORAL_FEATURES   = False   # True → add temporal-decay user/item features
+TEMPORAL_DECAY_RATE     = 0.9     # w = decay_rate ^ (days / 30)
+
+# Improvement 6: Session Features
+USE_SESSION_FEATURES    = False   # True → add session-based user features
+SESSION_GAP_HOURS       = 2.0     # time gap (hours) that defines a new session
+
+# Improvement 7: Category Affinity with Temporal Decay
+USE_CATEGORY_AFFINITY   = False   # True → add temporal category affinity features
+CAT_AFFINITY_DECAY_RATE = 0.95    # decay rate for category affinity weights
+
+# Improvement 8: Item Trend Features
+USE_ITEM_TRENDS         = False   # True → add multi-window item trend features
+ITEM_TREND_WINDOWS      = [7, 30, 90]   # trend windows in days
+
+# Improvement 9: UI History Features
+USE_UI_HISTORY          = False   # True → add user-item purchase history features
+
+# Improvement 10: Ensemble
+ENSEMBLE_SEEDS: list[int] = []   # e.g. [42, 123, 456] → train 3 models and ensemble
+ENSEMBLE_METHOD          = "reciprocal_rank"   # "reciprocal_rank" | "borda_count"
